@@ -1,0 +1,31 @@
+# --- Node / Vite ---
+node_modules/
+dist/
+.vite/
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Tauri / Rust build ---
+/target/
+src-tauri/target/
+src-tauri/target-*
+src-tauri/**/bundle/
+*.pdb
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Local data (只保留示例 / 说明) ---
+data/**
+!data/README.md
+!data/*.example.*
+!data/*.example.jsonl
+
+# --- 临时文件 ---
+*.tmp
+*.temp
