@@ -3,7 +3,8 @@ import React, { useMemo, useRef, useState } from 'react';
 import { DateTime } from 'luxon';
 import {
   minutesSinceMidnight, durationMinutes, snapMinutes, clamp,
-  isoForDayAndMinutes, MINUTES_PER_DAY, SNAP_MIN, overlaps
+  isoForDateAndMinutes, MINUTES_PER_DAY, SNAP_MIN, overlaps,
+  timeStringToMinutes
 } from '../lib/schedule';
 import type { Block, Task } from '../lib/data';
 
@@ -13,12 +14,17 @@ type Props = {
   weekStartISO: string;
   tasks: Task[];
   blocks: Block[];
+  visibleDays?: string[];
   onMove: (block_id: string, newStartISO: string) => Promise<void>;
   onResize: (block_id: string, newEndISO: string) => Promise<void>;
   onToggle: (block_id: string) => Promise<void>;
   onSelect?: (block_id: string) => void;
+  onDuplicate?: (block_id: string) => Promise<void>;
+  onDelete?: (block_id: string, scope: 'single'|'series') => Promise<void>;
+  onRequestCreate?: (opts: { dayISO: string; startMinutes: number; endMinutes: number }) => void;
   strategy?: Strategy;
   onNotify?: (msg: string) => void;
+  sleepRange?: { start: string; end: string } | null;
 };
 
 const HOUR_PX = 64; // 每小时像素（可调）
@@ -27,6 +33,7 @@ const MINUTE_PX = HOUR_PX / 60;
 const borderColor = '#e5e7eb'; // 灰色边线
 const cardBorder = '#d1d5db';
 const danger = '#ef4444';
+const sleepColor = 'rgba(59,130,246,0.12)';
 
 type DragState = null | {
   id: string;
@@ -43,8 +50,28 @@ type DragState = null | {
   colWidth: number;
 };
 
-export default function WeekGrid({ weekStartISO, tasks, blocks, onMove, onResize, onToggle, onSelect, strategy='allow', onNotify }: Props) {
-  const days = useMemo(() => Array.from({ length: 7 }, (_, i) => DateTime.fromISO(weekStartISO).plus({ days: i })), [weekStartISO]);
+export default function WeekGrid({
+  weekStartISO,
+  tasks,
+  blocks,
+  visibleDays,
+  onMove,
+  onResize,
+  onToggle,
+  onSelect,
+  onDuplicate,
+  onDelete,
+  onRequestCreate,
+  strategy='allow',
+  onNotify,
+  sleepRange,
+}: Props) {
+  const days = useMemo(() => {
+    if (visibleDays && visibleDays.length) {
+      return visibleDays.map(iso => DateTime.fromISO(iso));
+    }
+    return Array.from({ length: 7 }, (_, i) => DateTime.fromISO(weekStartISO).plus({ days: i }));
+  }, [visibleDays, weekStartISO]);
   const containerRef = useRef<HTMLDivElement>(null);
   const [drag, _setDrag] = useState<DragState>(null);
   const dragRef = useRef<DragState>(null);
@@ -69,12 +96,13 @@ export default function WeekGrid({ weekStartISO, tasks, blocks, onMove, onResize
     const map: Record<string, Block[]> = {};
     for (const d of days) map[d.toISODate()!] = [];
     for (const b of blocks) {
-      const d = DateTime.fromISO(b.start).toISODate()!;
-      if (!map[d]) map[d] = [];
-      map[d].push(b);
+      const dayISO = DateTime.fromISO(b.start).toISODate();
+      if (!dayISO) continue;
+      if (!map[dayISO]) continue;
+      map[dayISO].push(b);
     }
-    for (const k of Object.keys(map)) {
-      map[k].sort((a,b)=>DateTime.fromISO(a.start).toMillis()-DateTime.fromISO(b.start).toMillis());
+    for (const key of Object.keys(map)) {
+      map[key].sort((a, b) => DateTime.fromISO(a.start).toMillis() - DateTime.fromISO(b.start).toMillis());
     }
     return map;
   }, [blocks, days]);
@@ -186,47 +214,49 @@ export default function WeekGrid({ weekStartISO, tasks, blocks, onMove, onResize
         let eM = d.previewEndM;
         let overlapNow = computeOverlap(targetDay, b.block_id, sM, eM);
 
+        const targetISO = days[targetDay]?.toISODate();
+        const originalISO = days[d.originalDay]?.toISODate();
         if (overlapNow) {
           if (strategy === 'block') {
             onNotify && onNotify('与其它块重叠，已取消保存。');
           } else if (strategy === 'push' && d.mode === 'move') {
             const ng = findNextGap(targetDay, sM, d.duration);
-            if (ng >= 0) {
+            if (ng >= 0 && targetISO) {
               sM = ng;
               eM = sM + d.duration;
-              const newISO = isoForDayAndMinutes(weekStartISO, targetDay, sM);
+              const newISO = isoForDateAndMinutes(targetISO, sM);
               await onMove(b.block_id, newISO);
             } else {
               onNotify && onNotify('当天没有足够的空档，无法顺延。');
             }
           } else if (strategy === 'clip') {
-            if (d.mode === 'resize') {
+            if (d.mode === 'resize' && originalISO) {
               const lim = clipEndToFirstConflict(d.originalDay, b.block_id, d.startM, eM);
-              const newEndISO = isoForDayAndMinutes(weekStartISO, d.originalDay, Math.max(lim, d.startM + SNAP_MIN));
+              const newEndISO = isoForDateAndMinutes(originalISO, Math.max(lim, d.startM + SNAP_MIN));
               await onResize(b.block_id, newEndISO);
-            } else {
+            } else if (targetISO) {
               const lim = clipEndToFirstConflict(targetDay, b.block_id, sM, eM);
               eM = Math.max(lim, sM + SNAP_MIN);
-              const newEndISO = isoForDayAndMinutes(weekStartISO, targetDay, eM);
-              const newStartISO = isoForDayAndMinutes(weekStartISO, targetDay, sM);
+              const newEndISO = isoForDateAndMinutes(targetISO, eM);
+              const newStartISO = isoForDateAndMinutes(targetISO, sM);
               await onMove(b.block_id, newStartISO);
               await onResize(b.block_id, newEndISO);
             }
           } else {
-            if (d.mode === 'move') {
-              const newISO = isoForDayAndMinutes(weekStartISO, targetDay, sM);
+            if (d.mode === 'move' && targetISO) {
+              const newISO = isoForDateAndMinutes(targetISO, sM);
               await onMove(b.block_id, newISO);
-            } else {
-              const newEndISO = isoForDayAndMinutes(weekStartISO, d.originalDay, eM);
+            } else if (originalISO) {
+              const newEndISO = isoForDateAndMinutes(originalISO, eM);
               await onResize(b.block_id, newEndISO);
             }
           }
         } else {
-          if (d.mode === 'move') {
-            const newISO = isoForDayAndMinutes(weekStartISO, targetDay, sM);
+          if (d.mode === 'move' && targetISO) {
+            const newISO = isoForDateAndMinutes(targetISO, sM);
             await onMove(b.block_id, newISO);
-          } else {
-            const newEndISO = isoForDayAndMinutes(weekStartISO, d.originalDay, eM);
+          } else if (originalISO) {
+            const newEndISO = isoForDateAndMinutes(originalISO, eM);
             await onResize(b.block_id, newEndISO);
           }
         }
@@ -242,7 +272,7 @@ export default function WeekGrid({ weekStartISO, tasks, blocks, onMove, onResize
 
   const gridStyle: React.CSSProperties = {
     display: 'grid',
-    gridTemplateColumns: '96px repeat(7, 1fr)',
+    gridTemplateColumns: `96px repeat(${days.length}, 1fr)`,
     height: '100%',
     userSelect: drag ? 'none' : 'auto',
     fontSize: 12,
@@ -309,16 +339,56 @@ export default function WeekGrid({ weekStartISO, tasks, blocks, onMove, onResize
       </div>
 
       {/* 7 天列 */}
-      {days.map((d) => {
+      {days.map((d, idx) => {
         const iso = d.toISODate()!;
         const dayBlocks = byDay[iso] ?? [];
         return (
-          <div key={iso} style={dayColStyle}>
+          <div
+            key={iso}
+            style={dayColStyle}
+            onDoubleClick={(e) => {
+              if (!onRequestCreate) return;
+              const rect = e.currentTarget.getBoundingClientRect();
+              const relY = clamp(e.clientY - rect.top, 0, HOUR_PX * 24);
+              const startMinutes = clamp(snapMinutes(Math.round(relY / MINUTE_PX), SNAP_MIN), 0, MINUTES_PER_DAY - SNAP_MIN);
+              const endMinutes = Math.min(startMinutes + 60, MINUTES_PER_DAY);
+              onRequestCreate({ dayISO: iso, startMinutes, endMinutes });
+            }}
+          >
             {/* 背景小时网格线 */}
             {Array.from({ length: 24 }, (_, h) => (
               <div key={h} style={hourLineStyle(h)} />
             ))}
             <div style={stickyHeaderStyle}>{d.toFormat('ccc dd')}</div>
+
+            {sleepRange && (() => {
+              const start = timeStringToMinutes(sleepRange.start);
+              const end = timeStringToMinutes(sleepRange.end);
+              const segments: { start: number; end: number }[] = [];
+              if (start !== end) {
+                if (start < end) {
+                  segments.push({ start, end });
+                } else {
+                  segments.push({ start, end: MINUTES_PER_DAY });
+                  segments.push({ start: 0, end });
+                }
+              }
+              return segments.map((seg, sIdx) => (
+                <div
+                  key={`sleep-${idx}-${sIdx}`}
+                  style={{
+                    position:'absolute',
+                    left:0,
+                    right:0,
+                    top: seg.start * MINUTE_PX,
+                    height: Math.max((seg.end - seg.start) * MINUTE_PX, 1),
+                    background: sleepColor,
+                    pointerEvents:'none',
+                    zIndex:0,
+                  }}
+                />
+              ));
+            })()}
 
             {/* 渲染块 */}
             {dayBlocks.map(b => {
@@ -333,7 +403,10 @@ export default function WeekGrid({ weekStartISO, tasks, blocks, onMove, onResize
                   style={v.style}
                 >
                   <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-                    <div style={{ fontWeight:600, marginRight:8, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{labelFor(b)}</div>
+                    <div style={{ fontWeight:600, marginRight:8, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                      {labelFor(b)}
+                      {b.recurrence?.id && <span style={{ marginLeft:4, fontSize:11, color:'#2563eb' }}>↻</span>}
+                    </div>
                     <div style={{ display:'flex', gap:4 }} onClick={(ev)=>ev.stopPropagation()}>
                       <button
                         style={{ fontSize:12, padding:'2px 6px', border:'1px solid #d1d5db', borderRadius:6, background:'#fff' }}
@@ -341,8 +414,32 @@ export default function WeekGrid({ weekStartISO, tasks, blocks, onMove, onResize
                       >
                         {b.status === 'done' ? '↩︎' : '✅'}
                       </button>
+                      {onDuplicate && (
+                        <button
+                          style={{ fontSize:12, padding:'2px 6px', border:'1px solid #d1d5db', borderRadius:6, background:'#fff' }}
+                          onClick={async () => { await onDuplicate(b.block_id); }}
+                        >
+                          复制
+                        </button>
+                      )}
+                      {onDelete && (
+                        <button
+                          style={{ fontSize:12, padding:'2px 6px', border:'1px solid #d1d5db', borderRadius:6, background:'#fff' }}
+                          onClick={async () => {
+                            if (b.recurrence?.id) {
+                              const whole = window.confirm('删除整个重复系列？取消则仅删除当前块');
+                              await onDelete(b.block_id, whole ? 'series' : 'single');
+                            } else {
+                              const ok = window.confirm('确定删除这个块？');
+                              if (ok) await onDelete(b.block_id, 'single');
+                            }
+                          }}
+                        >
+                          删除
+                        </button>
+                      )}
                       <button
-                        style={{ fontSize:12, padding:'2px 6px', border:'1px solid #d1d5db', borderRadius:6, background:'#fff', cursor:'grab' }}
+                        style={{ fontSize:12, padding:'2px 6px', border:'1px solid #d1d5db', borderRadius:6, background:'#fff',cursor:'grab' }}
                         onMouseDown={(e)=>{ e.preventDefault(); e.stopPropagation(); onMouseDown(e, b, false); }}
                       >
                         拖

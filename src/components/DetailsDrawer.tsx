@@ -1,5 +1,5 @@
 // src/components/DetailsDrawer.tsx
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import type { Block, Task, ChecklistItem } from '../lib/data';
 import { DateTime } from 'luxon';
 

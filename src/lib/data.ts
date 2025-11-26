@@ -1,6 +1,18 @@
 // src/lib/data.ts
 export type BlockStatus = 'planned'|'in_progress'|'done'|'skipped';
 
+export type BlockRecurrence = {
+  id: string;
+  type: 'daily'|'weekly';
+  interval: number;
+  daysOfWeek?: number[];
+  startDate: string;      // ISO date of the first occurrence
+  startMinute: number;    // minutes since midnight
+  duration: number;       // duration minutes
+  until?: string | null;  // optional ISO date limit
+  exceptions?: string[];  // ISO dates to skip
+};
+
 export type Block = {
   block_id: string;
   task_id?: string;
@@ -10,6 +22,7 @@ export type Block = {
   end: string;
   status: BlockStatus;
   rev: number;
+  recurrence?: BlockRecurrence | null;
 };
 
 export type ChecklistItem = { id: string; text: string; done: boolean };

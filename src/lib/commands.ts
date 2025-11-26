@@ -1,6 +1,6 @@
 // src/lib/commands.ts
 import { ensureDataFolders, readText, writeText, exists } from './fs';
-import { parseJSONL, stringifyJSONL, type Task, type Block, type AICommandEnvelope, type ChecklistItem } from './data';
+import { parseJSONL, stringifyJSONL, type Task, type Block, type BlockRecurrence, type AICommandEnvelope } from './data';
 import { DateTime } from 'luxon';
 
 function nid(prefix: string) {
@@ -11,9 +11,126 @@ export async function loadTasks(): Promise<Task[]> {
   if (!(await exists('tasks.jsonl'))) return [];
   return parseJSONL<Task>(await readText('tasks.jsonl'));
 }
+function cloneRecurrence(rec?: BlockRecurrence | null): BlockRecurrence | null | undefined {
+  if (!rec) return rec;
+  return {
+    id: rec.id,
+    type: rec.type,
+    interval: rec.interval,
+    daysOfWeek: rec.daysOfWeek ? [...rec.daysOfWeek] : undefined,
+    startDate: rec.startDate,
+    startMinute: rec.startMinute,
+    duration: rec.duration,
+    until: rec.until ?? null,
+    exceptions: rec.exceptions ? [...rec.exceptions] : undefined,
+  };
+}
+
+function ensureExceptions(rec: BlockRecurrence | null | undefined) {
+  if (rec && !rec.exceptions) rec.exceptions = [];
+  return rec;
+}
+
+function shouldIncludeDate(rec: BlockRecurrence, date: DateTime) {
+  const anchor = DateTime.fromISO(rec.startDate);
+  if (!anchor.isValid) return false;
+  const limit = rec.until ? DateTime.fromISO(rec.until) : null;
+  if (limit && date.startOf('day') > limit.endOf('day')) return false;
+  if (date < anchor) return false;
+  const exceptions = rec.exceptions ?? [];
+  if (exceptions.includes(date.toISODate()!)) return false;
+  if (rec.type === 'daily') {
+    const diff = Math.floor(date.startOf('day').diff(anchor.startOf('day'), 'days').days);
+    return diff >= 0 && diff % Math.max(1, rec.interval) === 0;
+  }
+  const days = rec.daysOfWeek && rec.daysOfWeek.length ? rec.daysOfWeek : [anchor.weekday];
+  if (!days.includes(date.weekday)) return false;
+  const diffWeeks = Math.floor(date.startOf('week').diff(anchor.startOf('week'), 'weeks').weeks);
+  return diffWeeks >= 0 && diffWeeks % Math.max(1, rec.interval) === 0;
+}
+
+function setRecurrenceAnchor(rec: BlockRecurrence, anchor: DateTime) {
+  rec.startDate = anchor.toISODate()!;
+  rec.startMinute = anchor.hour * 60 + anchor.minute;
+}
+
+function extendRecurringBlocks(blocks: Block[]) {
+  const byId = new Map<string, { rec: BlockRecurrence; blocks: Block[] }>();
+  for (const blk of blocks) {
+    if (blk.recurrence?.id) {
+      const id = blk.recurrence.id;
+      if (!byId.has(id)) {
+        byId.set(id, { rec: cloneRecurrence(blk.recurrence)!, blocks: [] });
+      }
+      byId.get(id)!.blocks.push(blk);
+    }
+  }
+  if (!byId.size) return false;
+  let mutated = false;
+  const horizon = DateTime.now().plus({ days: 35 }).startOf('day');
+  for (const [, data] of byId) {
+    const { rec } = data;
+    const existingByDate = new Map<string, Block>();
+    for (const blk of data.blocks) {
+      existingByDate.set(DateTime.fromISO(blk.start).toISODate()!, blk);
+    }
+    const anchor = DateTime.fromISO(rec.startDate);
+    if (!anchor.isValid) continue;
+    let cursor = anchor.startOf('day');
+    const limitStart = DateTime.now().minus({ days: 7 }).startOf('day');
+    if (cursor < limitStart) cursor = limitStart;
+    while (cursor <= horizon) {
+      if (shouldIncludeDate(rec, cursor)) {
+        const isoDate = cursor.toISODate()!;
+        if (!existingByDate.has(isoDate)) {
+          const start = cursor.plus({ minutes: rec.startMinute });
+          const end = start.plus({ minutes: rec.duration });
+          const block: Block = {
+            block_id: nid('blk'),
+            task_id: data.blocks[0]?.task_id,
+            title: data.blocks[0]?.title,
+            notes_override: data.blocks[0]?.notes_override,
+            start: start.toISO()!,
+            end: end.toISO()!,
+            status: 'planned',
+            rev: 1,
+            recurrence: cloneRecurrence(rec),
+          };
+          blocks.push(block);
+          data.blocks.push(block);
+          existingByDate.set(isoDate, block);
+          mutated = true;
+        }
+      }
+      cursor = cursor.plus({ days: 1 });
+    }
+    if (rec.until) {
+      const limit = DateTime.fromISO(rec.until);
+      if (limit.isValid) {
+        for (const blk of data.blocks) {
+          if (DateTime.fromISO(blk.start) > limit.endOf('day')) {
+            // remove blocks beyond until
+            const idx = blocks.indexOf(blk);
+            if (idx >= 0) {
+              blocks.splice(idx, 1);
+              mutated = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return mutated;
+}
+
 export async function loadBlocks(): Promise<Block[]> {
   if (!(await exists('blocks.jsonl'))) return [];
-  return parseJSONL<Block>(await readText('blocks.jsonl'));
+  const blocks = parseJSONL<Block>(await readText('blocks.jsonl'));
+  const mutated = extendRecurringBlocks(blocks);
+  if (mutated) {
+    await saveBlocks(blocks);
+  }
+  return blocks;
 }
 export async function saveTasks(tasks: Task[]) {
   await writeText('tasks.jsonl', stringifyJSONL(tasks));
@@ -60,7 +177,8 @@ export async function applyCommandsFromInbox(filename = 'ai_inbox/commands.jsonl
             const id = p.block_id ?? nid('blk');
             blocks.push({
               block_id: id, task_id: p.task_id, title: p.title,
-              start: p.start, end: p.end, status: 'planned', rev: 1
+              start: p.start, end: p.end, status: 'planned', rev: 1,
+              recurrence: p.recurrence ? cloneRecurrence(p.recurrence) : null,
             });
             out.push({ for: (cmd as any).id, ok: true, effects: [{ block_id: id, created: true }] });
             break;
@@ -161,6 +279,26 @@ export async function moveBlock(block_id: string, newStartISO: string) {
   b.start = newStartISO;
   b.end = DateTime.fromISO(newStartISO).plus({ minutes: dur }).toISO()!;
   b.rev = (b.rev || 0) + 1;
+
+  if (b.recurrence?.id) {
+    const recId = b.recurrence.id;
+    const delta = DateTime.fromISO(newStartISO).diff(start, 'minutes').minutes;
+    const newDur = DateTime.fromISO(b.end).diff(DateTime.fromISO(b.start), 'minutes').minutes;
+    const anchor = DateTime.fromISO(b.recurrence.startDate).plus({ minutes: b.recurrence.startMinute }).plus({ minutes: delta });
+    setRecurrenceAnchor(b.recurrence, anchor);
+    b.recurrence.duration = newDur;
+    for (const other of blocks) {
+      if (other.block_id === block_id) continue;
+      if (other.recurrence?.id === recId && other.status !== 'done') {
+        const os = DateTime.fromISO(other.start).plus({ minutes: delta });
+        const oe = DateTime.fromISO(other.end).plus({ minutes: delta });
+        other.start = os.toISO()!;
+        other.end = oe.toISO()!;
+        other.recurrence = cloneRecurrence(b.recurrence);
+        other.rev = (other.rev || 0) + 1;
+      }
+    }
+  }
   await saveBlocks(blocks);
 }
 
@@ -170,5 +308,111 @@ export async function resizeBlock(block_id: string, newEndISO: string) {
   if (!b) throw new Error('NOT_FOUND: block');
   b.end = newEndISO;
   b.rev = (b.rev || 0) + 1;
+
+  if (b.recurrence?.id) {
+    const recId = b.recurrence.id;
+    const start = DateTime.fromISO(b.start);
+    const newDur = DateTime.fromISO(newEndISO).diff(start, 'minutes').minutes;
+    b.recurrence.duration = newDur;
+    for (const other of blocks) {
+      if (other.block_id === block_id) continue;
+      if (other.recurrence?.id === recId && other.status !== 'done') {
+        const os = DateTime.fromISO(other.start);
+        other.end = os.plus({ minutes: newDur }).toISO()!;
+        other.recurrence = cloneRecurrence(b.recurrence);
+        other.rev = (other.rev || 0) + 1;
+      }
+    }
+  }
   await saveBlocks(blocks);
+}
+
+export async function createTask(data: { title: string; notes?: string; tags?: string[]; priority?: 0|1|2 }) {
+  const tasks = await loadTasks();
+  const id = nid('tsk');
+  tasks.push({
+    task_id: id,
+    title: data.title,
+    notes: data.notes,
+    tags: data.tags ?? [],
+    priority: data.priority ?? 0,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    recurrence: null,
+  });
+  await saveTasks(tasks);
+  return id;
+}
+
+export async function createBlock(data: { task_id?: string; title?: string; notes_override?: string; start: string; end: string; recurrence?: BlockRecurrence | null }) {
+  const blocks = await loadBlocks();
+  const block: Block = {
+    block_id: nid('blk'),
+    task_id: data.task_id,
+    title: data.title,
+    notes_override: data.notes_override,
+    start: data.start,
+    end: data.end,
+    status: 'planned',
+    rev: 1,
+    recurrence: data.recurrence ? cloneRecurrence(data.recurrence) : null,
+  };
+  blocks.push(block);
+  await saveBlocks(blocks);
+  return block.block_id;
+}
+
+export async function deleteBlock(block_id: string, scope: 'single'|'series' = 'single') {
+  const blocks = await loadBlocks();
+  const idx = blocks.findIndex(b => b.block_id === block_id);
+  if (idx < 0) throw new Error('NOT_FOUND: block');
+  const blk = blocks[idx];
+  if (scope === 'series' && blk.recurrence?.id) {
+    const recId = blk.recurrence.id;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      if (blocks[i].recurrence?.id === recId) {
+        blocks.splice(i, 1);
+      }
+    }
+  } else if (blk.recurrence?.id) {
+    const recId = blk.recurrence.id;
+    const dateISO = DateTime.fromISO(blk.start).toISODate();
+    blocks.splice(idx, 1);
+    const others = blocks.filter(b => b.recurrence?.id === recId);
+    if (others.length) {
+      const rec = ensureExceptions(others[0].recurrence);
+      if (rec && dateISO && !(rec.exceptions ?? []).includes(dateISO)) {
+        rec.exceptions!.push(dateISO);
+      }
+      for (const other of others) {
+        other.recurrence = cloneRecurrence(rec ?? other.recurrence);
+        other.rev = (other.rev || 0) + 1;
+      }
+    }
+  } else {
+    blocks.splice(idx, 1);
+  }
+  await saveBlocks(blocks);
+}
+
+export async function duplicateBlock(block_id: string) {
+  const blocks = await loadBlocks();
+  const blk = blocks.find(b => b.block_id === block_id);
+  if (!blk) throw new Error('NOT_FOUND: block');
+  const start = DateTime.fromISO(blk.start);
+  const end = DateTime.fromISO(blk.end);
+  const copy: Block = {
+    block_id: nid('blk'),
+    task_id: blk.task_id,
+    title: blk.title,
+    notes_override: blk.notes_override,
+    start: start.toISO()!,
+    end: end.toISO()!,
+    status: blk.status,
+    rev: 1,
+    recurrence: null,
+  };
+  blocks.push(copy);
+  await saveBlocks(blocks);
+  return copy.block_id;
 }
